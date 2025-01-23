@@ -29,6 +29,11 @@ func GetWatchNamespaces() []string {
 		return nil
 	}
 
+	ns = strings.TrimSpace(ns)
+	if ns == "" {
+		return nil
+	}
+
 	// Add support for MultiNamespace set in WATCH_NAMESPACE (e.g ns1,ns2)
 	if strings.Contains(ns, ",") {
 		return strings.Split(ns, ",")
@@ -40,17 +45,15 @@ func GetWatchNamespaces() []string {
 // ManagerOptionsWithNamespaces returns an updated Options with namespaces information
 func ManagerOptionsWithNamespaces(logger logr.Logger, opt ctrl.Options) ctrl.Options {
 	namespaces := GetWatchNamespaces()
-	switch {
-	case len(namespaces) == 0:
-		logger.Info("Manager will watch and manage resources in all namespaces")
-	case len(namespaces) == 1:
-		logger.Info("Manager will be watching namespace", "namespace", namespaces[0])
-		opt.Namespace = namespaces[0]
-	case len(namespaces) > 1:
-		// configure cluster-scoped with MultiNamespacedCacheBuilder
-		logger.Info("Manager will be watching multiple namespaces", namespaces)
-		opt.Namespace = ""
-		opt.NewCache = cache.MultiNamespacedCacheBuilder(namespaces)
+	if len(namespaces) == 0 {
+		return opt
+	}
+
+	if opt.Cache.DefaultNamespaces == nil {
+		opt.Cache.DefaultNamespaces = make(map[string]cache.Config)
+	}
+	for _, namespace := range namespaces {
+		opt.Cache.DefaultNamespaces[namespace] = cache.Config{}
 	}
 
 	return opt

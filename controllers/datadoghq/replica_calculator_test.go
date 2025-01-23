@@ -3,15 +3,13 @@
 // This product includes software developed at Datadog (https://www.datadoghq.com/).
 // Copyright 2016-present Datadog, Inc.
 
-package controllers
+package datadoghq
 
 import (
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/DataDog/watermarkpodautoscaler/api/v1alpha1"
-	"github.com/DataDog/watermarkpodautoscaler/third_party/kubernetes/pkg/controller/podautoscaler/metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
@@ -32,6 +30,9 @@ import (
 	emfake "k8s.io/metrics/pkg/client/external_metrics/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	"github.com/DataDog/watermarkpodautoscaler/apis/datadoghq/v1alpha1"
+	"github.com/DataDog/watermarkpodautoscaler/third_party/kubernetes/pkg/controller/podautoscaler/metrics"
 )
 
 type resourceInfo struct {
@@ -51,12 +52,14 @@ type replicaCalcTestCase struct {
 	timestamp        time.Time
 	readyReplicas    int32
 	pos              metricPosition
+	details          string
 
-	namespace string
-	metric    *metricInfo
-	resource  *resourceInfo
-	scale     *autoscalingv1.Scale
-	wpa       *v1alpha1.WatermarkPodAutoscaler
+	namespace           string
+	metric              *metricInfo
+	recommenderResponse *ReplicaRecommendationResponse
+	resource            *resourceInfo
+	scale               *autoscalingv1.Scale
+	wpa                 *v1alpha1.WatermarkPodAutoscaler
 
 	podCondition         []corev1.PodCondition
 	podStartTime         []metav1.Time
@@ -93,7 +96,7 @@ func (tc *replicaCalcTestCase) getFakeResourceClient() *metricsfake.Clientset {
 				Containers: []metricsapi.ContainerMetrics{},
 			}
 
-			for j := 0; j < numContainersPerPod; j++ {
+			for j := range numContainersPerPod {
 				cm := metricsapi.ContainerMetrics{
 					Name: fmt.Sprintf("%s-%d-container-%d", podNamePrefix, i, j),
 					Usage: corev1.ResourceList{
@@ -164,7 +167,7 @@ func (tc *replicaCalcTestCase) prepareTestClientSet() *fake.Clientset {
 		if tc.podPhase != nil && len(tc.podPhase) > podsCount {
 			podsCount = len(tc.podPhase)
 		}
-		for i := 0; i < podsCount; i++ {
+		for i := range podsCount {
 			podReadiness := corev1.ConditionTrue
 			podTransitionTime := metav1.Now()
 			if tc.podCondition != nil && i < len(tc.podCondition) {
@@ -249,8 +252,9 @@ func (tc *replicaCalcTestCase) runTest(t *testing.T) {
 	rClient := tc.getFakeResourceClient()
 
 	mClient := metrics.NewRESTMetricsClient(rClient.MetricsV1beta1(), nil, emClient)
+	recoClient := NewMockRecommenderClient()
 
-	replicaCalculator := NewReplicaCalculator(mClient, informer.Lister())
+	replicaCalculator := NewReplicaCalculator(mClient, recoClient, informer.Lister(), "test-cluster")
 
 	stop := make(chan struct{})
 	defer close(stop)
@@ -261,33 +265,34 @@ func (tc *replicaCalcTestCase) runTest(t *testing.T) {
 
 	var replicaCalculation ReplicaCalculation
 	var err error
-	if tc.metric.spec.Resource != nil {
+	if tc.recommenderResponse != nil {
+		recoClient.ReturnedResponse = *tc.recommenderResponse
+		recoClient.Error = tc.expectedError
+		replicaCalculation, err = replicaCalculator.GetRecommenderReplicas(logf.Log, tc.scale, tc.wpa)
+	} else if tc.metric.spec.Resource != nil {
 		// Resource metric tests
 		// Update with the correct labels.
 		replicaCalculation, err = replicaCalculator.GetResourceReplicas(logf.Log, tc.scale, tc.metric.spec, tc.wpa)
-
-		if tc.expectedError != nil {
-			require.Error(t, err, "there should be an error calculating the replica count")
-			assert.Contains(t, err.Error(), tc.expectedError.Error(), "the error message should have contained the expected error message")
-			return
-		}
 	} else if tc.metric.spec.External != nil {
 		// External metric tests
 		replicaCalculation, err = replicaCalculator.GetExternalMetricReplicas(logf.Log, tc.scale, tc.metric.spec, tc.wpa)
-		if tc.expectedError != nil {
-			require.Error(t, err, "there should be an error calculating the replica count")
-			assert.Contains(t, err.Error(), tc.expectedError.Error(), "the error message should have contained the expected error message")
-			return
-		}
+	}
+	if tc.expectedError != nil {
+		require.Error(t, err, "there should be an error calculating the replica count")
+		assert.Contains(t, err.Error(), tc.expectedError.Error(), "the error message should have contained the expected error message")
+		return
 	}
 
 	require.NoError(t, err, "there should not have been an error calculating the replica count")
 	assert.Equal(t, tc.expectedReplicas, replicaCalculation.replicaCount, "replicas should be as expected")
-	assert.Equal(t, tc.metric.expectedUtilization, replicaCalculation.utilization, "utilization should be as expected")
+	if tc.metric != nil {
+		assert.Equal(t, tc.metric.expectedUtilization, replicaCalculation.utilization, "utilization should be as expected")
+	}
 	assert.True(t, tc.timestamp.Equal(replicaCalculation.timestamp), "timestamp should be as expected")
 	assert.Equal(t, tc.readyReplicas, replicaCalculation.readyReplicas, "ready replicas should be as expected")
 	assert.Equal(t, tc.pos.isAbove, replicaCalculation.pos.isAbove, "metric should be above the Watermark")
 	assert.Equal(t, tc.pos.isBelow, replicaCalculation.pos.isBelow, "metric should be below the Watermark")
+	assert.Equal(t, tc.details, replicaCalculation.details, "details should be as expected")
 }
 
 func TestReplicaCalcDisjointResourcesMetrics(t *testing.T) {
@@ -468,6 +473,8 @@ func TestScaleIntervalReplicaCalcConvergeNoScaleDown(t *testing.T) {
 				Metrics:                      []v1alpha1.MetricSpec{metric1},
 				ReplicaScalingAbsoluteModulo: v1alpha1.NewInt32(1),
 				ConvergeTowardsWatermark:     "highwatermark",
+				MinReplicas:                  v1alpha1.NewInt32(1),
+				MaxReplicas:                  10,
 			},
 		},
 		metric: &metricInfo{
@@ -502,6 +509,8 @@ func TestScaleIntervalReplicaCalcConvergeDefault(t *testing.T) {
 				Metrics:                      []v1alpha1.MetricSpec{metric1},
 				ReplicaScalingAbsoluteModulo: v1alpha1.NewInt32(1),
 				ConvergeTowardsWatermark:     "",
+				MinReplicas:                  v1alpha1.NewInt32(1),
+				MaxReplicas:                  10,
 			},
 		},
 		metric: &metricInfo{
@@ -570,6 +579,8 @@ func TestScaleIntervalReplicaCalcConvergeScaleUp(t *testing.T) {
 				Metrics:                      []v1alpha1.MetricSpec{metric1},
 				ReplicaScalingAbsoluteModulo: v1alpha1.NewInt32(1),
 				ConvergeTowardsWatermark:     "lowwatermark",
+				MinReplicas:                  v1alpha1.NewInt32(1),
+				MaxReplicas:                  10,
 			},
 		},
 		metric: &metricInfo{
@@ -604,6 +615,8 @@ func TestScaleIntervalReplicaCalcConvergeScaleDown(t *testing.T) {
 				Metrics:                      []v1alpha1.MetricSpec{metric1},
 				ReplicaScalingAbsoluteModulo: v1alpha1.NewInt32(1),
 				ConvergeTowardsWatermark:     "highwatermark",
+				MinReplicas:                  v1alpha1.NewInt32(1),
+				MaxReplicas:                  10,
 			},
 		},
 		metric: &metricInfo{
@@ -1736,6 +1749,8 @@ func TestReplicaCountConvergingDownwardBlocked(t *testing.T) {
 				Tolerance:                    *resource.NewMilliQuantity(10, resource.DecimalSI),
 				Metrics:                      []v1alpha1.MetricSpec{metric1},
 				ReplicaScalingAbsoluteModulo: v1alpha1.NewInt32(1),
+				MinReplicas:                  v1alpha1.NewInt32(1),
+				MaxReplicas:                  10,
 			},
 		},
 		metric: &metricInfo{
@@ -1743,6 +1758,142 @@ func TestReplicaCountConvergingDownwardBlocked(t *testing.T) {
 			levels:              []int64{80000}, // We are within the watermarks
 			expectedUtilization: 80000,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcWithRecommender(t *testing.T) {
+	logf.SetLogger(zap.New())
+	recommender := v1alpha1.RecommenderSpec{
+		URL:           "http://recommender.example.com",
+		Settings:      map[string]string{"foo": "bar"},
+		TargetType:    "cpu",
+		HighWatermark: resource.NewMilliQuantity(700, resource.DecimalSI),
+		LowWatermark:  resource.NewMilliQuantity(200, resource.DecimalSI),
+	}
+	wpa := &v1alpha1.WatermarkPodAutoscaler{
+		Spec: v1alpha1.WatermarkPodAutoscalerSpec{
+			Recommender:                  &recommender,
+			ReplicaScalingAbsoluteModulo: v1alpha1.NewInt32(1),
+			MinReplicas:                  v1alpha1.NewInt32(1),
+			MaxReplicas:                  10,
+		},
+	}
+	ts := time.Now()
+	tcs := []replicaCalcTestCase{
+		// No doing anything.
+		{
+			expectedReplicas: 3,
+			readyReplicas:    3,
+			timestamp:        ts,
+			pos: metricPosition{
+				isAbove: false,
+				isBelow: false,
+			},
+			details: "Fake",
+			scale:   makeScale(testDeploymentName, 3, map[string]string{"name": "test-pod"}),
+			wpa:     wpa,
+			recommenderResponse: &ReplicaRecommendationResponse{
+				Replicas:           3,
+				ReplicasLowerBound: 2,
+				ReplicasUpperBound: 6,
+				Timestamp:          ts,
+				Details:            "Fake",
+			},
+		},
+		// Upscale
+		{
+			expectedReplicas: 5,
+			readyReplicas:    1,
+			timestamp:        ts,
+			pos: metricPosition{
+				isAbove: true,
+				isBelow: false,
+			},
+			details: "Fake",
+			scale:   makeScale(testDeploymentName, 1, map[string]string{"name": "test-pod"}),
+			wpa:     wpa,
+			recommenderResponse: &ReplicaRecommendationResponse{
+				Replicas:           5,
+				ReplicasLowerBound: 2,
+				ReplicasUpperBound: 6,
+				Timestamp:          ts,
+				Details:            "Fake",
+			},
+		},
+		// Downscale
+		{
+			expectedReplicas: 2,
+			readyReplicas:    10,
+			timestamp:        ts,
+			pos: metricPosition{
+				isAbove: false,
+				isBelow: true,
+			},
+			details: "Fake",
+			scale:   makeScale(testDeploymentName, 10, map[string]string{"name": "test-pod"}),
+			wpa:     wpa,
+			recommenderResponse: &ReplicaRecommendationResponse{
+				Replicas:           2,
+				ReplicasLowerBound: 2,
+				ReplicasUpperBound: 6,
+				Timestamp:          ts,
+				Details:            "Fake",
+			},
+		},
+		// toward downscale but within bounds should not have isAbove/isBelow all true
+		{
+			expectedReplicas: 31,
+			readyReplicas:    40,
+			timestamp:        ts,
+			pos: metricPosition{
+				isAbove: false,
+				isBelow: false,
+			},
+			details: "Fake",
+			scale:   makeScale(testDeploymentName, 40, map[string]string{"name": "test-pod"}),
+			wpa:     wpa,
+			recommenderResponse: &ReplicaRecommendationResponse{
+				Replicas:           31,
+				ReplicasLowerBound: 27,
+				ReplicasUpperBound: 53,
+				Timestamp:          ts,
+				Details:            "Fake",
+			},
+		},
+	}
+	for i, tc := range tcs {
+		t.Run(fmt.Sprintf("test-%d", i), tc.runTest)
+	}
+}
+
+func TestReplicasWithRecommenderError(t *testing.T) {
+	logf.SetLogger(zap.New())
+	recommender := v1alpha1.RecommenderSpec{
+		URL:           "http://recommender.example.com",
+		Settings:      map[string]string{"foo": "bar"},
+		TargetType:    "cpu",
+		HighWatermark: resource.NewMilliQuantity(700, resource.DecimalSI),
+		LowWatermark:  resource.NewMilliQuantity(200, resource.DecimalSI),
+	}
+	tc := replicaCalcTestCase{
+		expectedReplicas: 3,
+		readyReplicas:    3,
+		pos: metricPosition{
+			isAbove: false,
+			isBelow: false,
+		},
+		scale: makeScale(testDeploymentName, 3, map[string]string{"name": "test-pod"}),
+		wpa: &v1alpha1.WatermarkPodAutoscaler{
+			Spec: v1alpha1.WatermarkPodAutoscalerSpec{
+				Recommender:                  &recommender,
+				ReplicaScalingAbsoluteModulo: v1alpha1.NewInt32(1),
+				MinReplicas:                  v1alpha1.NewInt32(1),
+				MaxReplicas:                  10,
+			},
+		},
+		recommenderResponse: &ReplicaRecommendationResponse{},
+		expectedError:       fmt.Errorf("no recommendation received from recommender"),
 	}
 	tc.runTest(t)
 }
@@ -2202,7 +2353,7 @@ func TestGroupPods(t *testing.T) {
 		metrics             metrics.PodMetricsInfo
 		resource            corev1.ResourceName
 		expectReadyPodCount int
-		expectIgnoredPods   sets.String
+		expectIgnoredPods   sets.Set[string]
 	}{
 		{
 			"void",
@@ -2211,7 +2362,7 @@ func TestGroupPods(t *testing.T) {
 			metrics.PodMetricsInfo{},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString(),
+			sets.New[string](),
 		},
 		{
 			"count in a ready pod - memory",
@@ -2235,7 +2386,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceMemory,
 			1,
-			sets.NewString(),
+			sets.New[string](),
 		},
 		{
 			"ignore a pod without ready condition - CPU",
@@ -2262,7 +2413,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString("lucretius"),
+			sets.New[string]("lucretius"),
 		},
 		{
 			"count in a ready pod with fresh metrics during initialization period - CPU",
@@ -2296,7 +2447,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			1,
-			sets.NewString(),
+			sets.New[string](),
 		},
 		{
 			"ignore an unready pod during initialization period - CPU",
@@ -2330,7 +2481,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString("lucretius"),
+			sets.New[string]("lucretius"),
 		},
 		{
 			"count in a ready pod without fresh metrics after initialization period - CPU",
@@ -2365,7 +2516,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			1,
-			sets.NewString(),
+			sets.New[string](),
 		},
 
 		{
@@ -2400,7 +2551,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString("lucretius"),
+			sets.New[string]("lucretius"),
 		},
 		{
 			"ignore pod that has never been ready after initialization period - CPU",
@@ -2434,7 +2585,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString("lucretius"),
+			sets.New[string]("lucretius"),
 		},
 		{
 			"a missing pod",
@@ -2459,7 +2610,7 @@ func TestGroupPods(t *testing.T) {
 			metrics.PodMetricsInfo{},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString(),
+			sets.New[string](),
 		},
 		{
 			"several pods",
@@ -2524,7 +2675,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString("lucretius", "niccolo"),
+			sets.New[string]("lucretius", "niccolo"),
 		},
 		{
 			"too many pods in scope with labels",
@@ -2597,7 +2748,7 @@ func TestGroupPods(t *testing.T) {
 			},
 			corev1.ResourceCPU,
 			0,
-			sets.NewString("epicurus"),
+			sets.New[string]("epicurus"),
 		},
 		{
 			name:       "pending pods are ignored",
@@ -2619,7 +2770,7 @@ func TestGroupPods(t *testing.T) {
 			metrics:             metrics.PodMetricsInfo{},
 			resource:            corev1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectIgnoredPods:   sets.NewString("unscheduled"),
+			expectIgnoredPods:   sets.New[string]("unscheduled"),
 		},
 		{
 			name:       "pods from other Deployments are ignored",
@@ -2641,7 +2792,7 @@ func TestGroupPods(t *testing.T) {
 			metrics:             metrics.PodMetricsInfo{},
 			resource:            corev1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectIgnoredPods:   sets.NewString(),
+			expectIgnoredPods:   sets.New[string](),
 		},
 	}
 	for _, tc := range tests {
@@ -2699,7 +2850,7 @@ func TestRemoveMetricsForPods(t *testing.T) {
 		}
 	}
 
-	podsToRm := sets.NewString("pod2", "pod3")
+	podsToRm := sets.New[string]("pod2", "pod3")
 
 	t.Run("test remove metrics for pods", func(t *testing.T) {
 		removeMetricsForPods(fakePodMetrics, podsToRm)
@@ -2891,7 +3042,7 @@ func TestGetReadyPodsCount(t *testing.T) {
 			informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
 			informer := informerFactory.Core().V1().Pods()
 
-			replicaCalculator := NewReplicaCalculator(nil, informer.Lister())
+			replicaCalculator := NewReplicaCalculator(nil, nil, informer.Lister(), "test-cluster")
 
 			stop := make(chan struct{})
 			defer close(stop)
@@ -2901,7 +3052,7 @@ func TestGetReadyPodsCount(t *testing.T) {
 			}
 
 			podList, err := replicaCalculator.podLister.Pods(tc.scale.Namespace).List(labels.SelectorFromSet(f.selector))
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			val, _, err := replicaCalculator.getReadyPodsCount(logf.Log, tc.scale.Name, podList, readinessDelay*time.Second)
 			assert.Equal(t, f.expected, val)

@@ -21,12 +21,13 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth" // Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	monitorv1alpha1 "github.com/DataDog/datadog-operator/apis/datadoghq/v1alpha1"
-	datadoghqv1alpha1 "github.com/DataDog/watermarkpodautoscaler/api/v1alpha1"
-	"github.com/DataDog/watermarkpodautoscaler/controllers"
+	datadoghqv1alpha1 "github.com/DataDog/watermarkpodautoscaler/apis/datadoghq/v1alpha1"
+	datadoghqcontrollers "github.com/DataDog/watermarkpodautoscaler/controllers/datadoghq"
 	"github.com/DataDog/watermarkpodautoscaler/pkg/config"
 	"github.com/DataDog/watermarkpodautoscaler/pkg/version"
 	// +kubebuilder:scaffold:imports
@@ -45,7 +46,6 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(datadoghqv1alpha1.AddToScheme(scheme))
-	utilruntime.Must(monitorv1alpha1.AddToScheme(scheme))
 }
 
 func main() {
@@ -55,9 +55,11 @@ func main() {
 	var logEncoder string
 	var logTimestampFormat string
 	var syncPeriodSeconds int
-	var leaderElectionResourceLock string
+	var clientTimeoutDuration time.Duration
+	var clientQPSLimit float64
 	var ddProfilingEnabled bool
 	var workers int
+	var skipNotScalingEvents bool
 	flag.BoolVar(&printVersionArg, "version", false, "print version and exit")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", true,
@@ -65,22 +67,20 @@ func main() {
 	flag.IntVar(&healthPort, "health-port", healthPort, "Port to use for the health probe")
 	flag.StringVar(&logEncoder, "logEncoder", "json", "log encoding ('json' or 'console')")
 	flag.StringVar(&logTimestampFormat, "log-timestamp-format", "millis", "log timestamp format ('millis', 'nanos', 'epoch', 'rfc3339' or 'rfc3339nano')")
-	flag.IntVar(&syncPeriodSeconds, "syncPeriodSeconds", 60*60, "The informers resync period in seconds") // default 1 hour
-	flag.StringVar(&leaderElectionResourceLock, "leader-election-resource", "configmaps", "determines which resource lock to use for leader election. option:[configmapsleases|endpointsleases|configmaps]")
+	flag.IntVar(&syncPeriodSeconds, "syncPeriodSeconds", 60*60, "The informers resync period in seconds")                                            // default 1 hour
+	flag.DurationVar(&clientTimeoutDuration, "client-timeout", 0, "The maximum length of time to wait before giving up on a kube-apiserver request") // is set to 0, keep default
+	flag.Float64Var(&clientQPSLimit, "client-qps", 0, "QPS Limit for the Kubernetes client (default 20 qps)")
 	flag.BoolVar(&ddProfilingEnabled, "ddProfilingEnabled", false, "Enable the datadog profiler")
 	flag.IntVar(&workers, "workers", 1, "Maximum number of concurrent Reconciles which can be run")
+	flag.BoolVar(&skipNotScalingEvents, "skipNotScalingEvents", false, "Log NotScaling decisions instead of creating Kubernetes events")
 
 	logLevel := zap.LevelFlag("loglevel", zapcore.InfoLevel, "Set log level")
 
 	flag.Parse()
 
-	exitCode := 0
-	defer func() { os.Exit(exitCode) }()
-
 	if err := customSetupLogging(*logLevel, logEncoder, logTimestampFormat); err != nil {
 		setupLog.Error(err, "unable to setup the logger")
-		exitCode = 1
-		return
+		os.Exit(1)
 	}
 
 	if ddProfilingEnabled {
@@ -104,48 +104,57 @@ func main() {
 	syncDuration := time.Duration(syncPeriodSeconds) * time.Second
 	restConfig := ctrl.GetConfigOrDie()
 	restConfig.UserAgent = "wpa-controller"
+	if clientTimeoutDuration != 0 {
+		// override client timeout duration if set
+		restConfig.Timeout = clientTimeoutDuration
+	}
+	if clientQPSLimit > 0 {
+		restConfig.QPS = float32(clientQPSLimit)     // Potentially loosing precision and by out of range, though given the range of QPS in practice, it should be fine
+		restConfig.Burst = int(clientQPSLimit * 1.5) // Burst is 50% more than QPS (same as default ratio)
+	}
 	mgr, err := ctrl.NewManager(restConfig, config.ManagerOptionsWithNamespaces(setupLog, ctrl.Options{
-		Scheme:                     scheme,
-		MetricsBindAddress:         fmt.Sprintf("%s:%d", host, metricsPort),
-		Port:                       9443,
-		LeaderElection:             enableLeaderElection,
-		LeaderElectionID:           "watermarkpodautoscaler-lock",
-		LeaderElectionResourceLock: leaderElectionResourceLock,
-		HealthProbeBindAddress:     fmt.Sprintf("%s:%d", host, healthPort),
-		SyncPeriod:                 &syncDuration,
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: fmt.Sprintf("%s:%d", host, metricsPort),
+		},
+		LeaderElection:         enableLeaderElection,
+		LeaderElectionID:       "watermarkpodautoscaler-lock",
+		HealthProbeBindAddress: fmt.Sprintf("%s:%d", host, healthPort),
+		Cache: cache.Options{
+			SyncPeriod: &syncDuration,
+		},
 	}))
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
-		exitCode = 1
-		return
+		os.Exit(1)
 	}
 
 	managerLogger := ctrl.Log.WithName("controllers").WithName("WatermarkPodAutoscaler")
 	klog.SetLogger(managerLogger) // Redirect klog to the controller logger (zap)
 
-	if err = (&controllers.WatermarkPodAutoscalerReconciler{
-		Client: mgr.GetClient(),
-		Log:    managerLogger,
-		Scheme: mgr.GetScheme(),
+	if err = (&datadoghqcontrollers.WatermarkPodAutoscalerReconciler{
+		Client:  mgr.GetClient(),
+		Log:     managerLogger,
+		Scheme:  mgr.GetScheme(),
+		Options: datadoghqcontrollers.Options{SkipNotScalingEvents: skipNotScalingEvents},
 	}).SetupWithManager(mgr, workers); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WatermarkPodAutoscaler")
-		exitCode = 1
-		return
+		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("health-probe", healthz.Ping); err != nil {
 		setupLog.Error(err, "Unable add liveness check")
-		exitCode = 1
-		return
+		os.Exit(1)
 	}
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
-		exitCode = 1
-		return
+		os.Exit(1)
 	}
+
+	os.Exit(0)
 }
 
 func customSetupLogging(logLevel zapcore.Level, logEncoder, logTimestampFormat string) error {

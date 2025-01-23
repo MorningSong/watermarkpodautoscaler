@@ -1,9 +1,13 @@
 name: validation
 on: [push, pull_request]
+# Permission forced by repo-level setting; only elevate on job-level
+permissions:
+  contents: read
+  # packages: read
 env:
   GO111MODULE: "on"
   PROJECTNAME: "watermarkpodautoscaler"
-  GO_VERSION: 1.19
+  GO_VERSION: 1.22
 jobs:
   build:
     runs-on: ubuntu-latest
